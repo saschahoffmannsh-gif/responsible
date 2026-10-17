@@ -309,12 +309,13 @@ async function fetchIcs(url: string) {
   } catch (e) { if ((e as Error).name === "AbortError") throw new Error("Der Kalender-Link antwortet nicht."); throw e; } finally { clearTimeout(tm); }
 }
 // Ersetzt alle Termine einer Quelle; nur geänderte Zeilen werden geschrieben
+const canon = (o: any) => JSON.stringify(o, Object.keys(o || {}).sort());
 async function replaceFeedEvents(g: string, feedId: string, events: { id: string; data: any }[], me: string | null) {
   const existing = must(await db.from("rs_item").select("id,data,deleted,rev").eq("grp", g).eq("coll", "fev").eq("data->>feed", feedId)) as any[];
   const byId = new Map(existing.map((r) => [r.id, r]));
   const newIds = new Set(events.map((e) => e.id));
   const ups: any[] = [];
-  for (const e of events) { const c = byId.get(e.id); if (!c || c.deleted || JSON.stringify(c.data) !== JSON.stringify(e.data)) ups.push({ grp: g, coll: "fev", id: e.id, data: e.data, deleted: false, rev: (c?.rev || 0) + 1, updated_by: me }); }
+  for (const e of events) { const c = byId.get(e.id); if (!c || c.deleted || canon(c.data) !== canon(e.data)) ups.push({ grp: g, coll: "fev", id: e.id, data: e.data, deleted: false, rev: (c?.rev || 0) + 1, updated_by: me }); }
   for (let i = 0; i < ups.length; i += 500) must(await db.from("rs_item").upsert(ups.slice(i, i + 500)));
   const gone = existing.filter((r) => !r.deleted && !newIds.has(r.id)).map((r) => r.id);
   for (let i = 0; i < gone.length; i += 200) must(await db.from("rs_item").update({ deleted: true, data: { feed: feedId } }).eq("grp", g).eq("coll", "fev").in("id", gone.slice(i, i + 200)));

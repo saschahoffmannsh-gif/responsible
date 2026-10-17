@@ -146,7 +146,7 @@ function uploadIcs(feedId) {
     let name = file.name.replace(/\.ics$/i, '').slice(0, 60);
     if (!feedId) { const r = await promptDlg('ICS-Datei importieren', [{name:'name', label:'Name der Quelle', value:name, ph:'z. B. Abfuhrkalender 2026'}], 'Importieren', 'Die Termine erscheinen für alle im Tab „Müll & Gemeinsam“.'); if (!r) return; name = r.values.name || name; r.modal.close(); }
     toast('Kalender wird importiert …', 'info');
-    try { const j = await api('/feed', feedId ? {g:G, action:'refresh', id:feedId, ics:text} : {g:G, action:'add', name, ics:text}); toast(`${plural(j.count, 'Termin', 'Termine')} importiert.`); await sync(true); }
+    try { const j = await api('/feed', feedId ? {g:G, action:'refresh', id:feedId, ics:text} : {g:G, action:'add', name, ics:text}); await sync(true); toast(`${plural(j.count, 'Termin', 'Termine')} importiert.`); }
     catch (e) { toast(e.message, 'err'); }
   });
 }
@@ -155,7 +155,7 @@ async function subscribeIcs() {
   if (!r) return; const {name, url} = r.values;
   if (!/^(https?|webcals?):\/\//i.test(url.trim())) { r.modal.querySelector('[data-err]').textContent = 'Bitte einen gültigen Link eingeben.'; return subscribeIcsRetry(r); }
   r.modal.close(); toast('Kalender wird geladen …', 'info');
-  try { const j = await api('/feed', {g:G, action:'add', name, url:url.trim()}); toast(`Abonniert: ${plural(j.count, 'Termin', 'Termine')}.`); await sync(true); } catch (e) { toast(e.message, 'err'); }
+  try { const j = await api('/feed', {g:G, action:'add', name, url:url.trim()}); await sync(true); toast(`Abonniert: ${plural(j.count, 'Termin', 'Termine')}.`); } catch (e) { toast(e.message, 'err'); }
 }
 function subscribeIcsRetry(r) { r.modal.close(); toast('Bitte einen gültigen Link (https:// oder webcal://) eingeben.', 'err'); }
 
