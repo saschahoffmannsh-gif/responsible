@@ -357,8 +357,8 @@ const ACT = {
 function storeMe() { if (ACC.list[ME.id]) { ACC.list[ME.id].name = ME.name; ACC.list[ME.id].avatar = ME.avatar; saveAcc(); } const m = member(ME.id); if (m) { m.avatar = ME.avatar; m.name = ME.name; } render(); }
 let colorT = null;
 async function setColor(c) {
-  const m = member(ME.id); if (!m) return; const prev = m.color; m.color = c; render();
-  try { await api('/group', {g:G, action:'color', color:c}); } catch (e) { m.color = prev; render(); toast(e.message, 'err'); }
+  const m = member(ME.id), prev = m?.color; if (m) { m.color = c; render(); }
+  try { await api('/group', {g:G, action:'color', color:c}); toast('Deine Farbe ist gespeichert.'); sync(true); } catch (e) { if (m) { m.color = prev; render(); } toast(e.message, 'err'); }
 }
 const FORMS = {
   async login(f) {
@@ -432,8 +432,9 @@ document.addEventListener('touchend', (e) => {
   if (!ME && pend) handleJoinToken(pend);
   render(); startPolling();
   if ('serviceWorker' in navigator && !/[?&]nosw/.test(location.search)) {
-    let reloaded = false;
-    navigator.serviceWorker.addEventListener('controllerchange', () => { if (!reloaded && sessionStorage.getItem('rs_swr') !== VERSION) { reloaded = true; sessionStorage.setItem('rs_swr', VERSION); location.reload(); } });
+    let reloaded = false; const hadController = !!navigator.serviceWorker.controller;
+    // Nur bei einem echten Update neu laden (nicht bei der ersten Installation)
+    navigator.serviceWorker.addEventListener('controllerchange', () => { if (hadController && !reloaded && !document.querySelector('.modal-bg')) { reloaded = true; location.reload(); } });
     navigator.serviceWorker.register('sw.js').then((r) => r.update()).catch(() => {});
   }
 })();

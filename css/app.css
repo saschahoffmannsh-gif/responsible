@@ -254,3 +254,4 @@ legend{font-size:13px;font-weight:650;margin-bottom:8px}
 .danger-zone{margin-top:22px;display:flex;flex-direction:column;gap:10px}
 .photo-pick{display:flex;align-items:center;gap:14px;margin-bottom:14px}
 .spinner{width:22px;height:22px;border-radius:50%;border:3px solid var(--blue2);border-top-color:var(--blue);animation:spin .8s linear infinite;margin:30px auto}
+.daypanel,#main>*{scroll-margin-top:72px}

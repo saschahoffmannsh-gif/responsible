@@ -1,7 +1,7 @@
 'use strict';
 // Responsible – Kern: Hilfsfunktionen, Konten, API, Synchronisation
 const API = window.RS_API || 'https://wlujgkbtpjxuekwsgnmg.supabase.co/functions/v1/responsible';
-const VERSION = '1.0.0';
+const VERSION = '1.0.1';
 const PALETTE = ['#467ba6','#d9778f','#36a78a','#e0a93b','#8a6fd1','#e2725b','#3aa6c9','#7a9a3a','#c45ab3','#5b6b7d','#d4a017','#2f9e6e'];
 const EVENT_TYPES = [
   {id:'private',label:'Privat',c:'#36a78a'},{id:'work',label:'Arbeit',c:'#d6455d'},{id:'vacation',label:'Urlaub',c:'#e0a93b'},
@@ -143,8 +143,9 @@ function loadCache() {
   if (c) { D.group = c.group; D.members = c.members || []; D.invites = c.invites || []; D.seq = c.seq || 0; for (const r of c.items || []) D.items.set(r.coll + '|' + r.id, r); }
 }
 function setSync(s) { SYNC = s; const el = $('#syncbtn'); if (el) { el.className = 'icon-btn sync--' + s; el.title = s === 'online' ? 'Gemeinsamer Kalender aktuell – jetzt neu laden' : s === 'syncing' ? 'Wird synchronisiert …' : 'Server nicht erreichbar – erneut versuchen'; } }
-let syncing = false, lastMe = 0;
+let syncing = false, syncAgain = false, lastMe = 0;
 async function sync(manual=false) {
+  if (syncing && manual) { syncAgain = true; return; }
   if (!G || !ME || syncing || (PENDING > 0 && !manual)) return;
   syncing = true; const g = G;
   if (manual) setSync('syncing');
@@ -166,7 +167,7 @@ async function sync(manual=false) {
   } catch (e) {
     if (e.gone) { toast('Du bist nicht mehr Mitglied dieser Gruppe.', 'err'); await refreshMe(true); }
     else if (e.code !== 401) { setSync('offline'); if (manual) toast('Der gemeinsame Kalender ist gerade nicht erreichbar.', 'err'); }
-  } finally { syncing = false; }
+  } finally { syncing = false; if (syncAgain) { syncAgain = false; sync(true); } }
 }
 async function refreshMe(rerender=false) {
   lastMe = Date.now();
