@@ -16,6 +16,7 @@ function render() {
 function afterRender() {
   const sb = $('#shop-input'); if (sb) updateShopSuggest();
   const pending = AUTH.pendingInvite; const el = $('#invite-slot'); if (el && pending) el.innerHTML = inviteBanner(pending);
+  if (ME && G) { refreshThread(); checkDueReminders(); if (UI.view === 'einstellungen') refreshPush(); }
 }
 
 // ---------- Anmeldung ----------
@@ -142,7 +143,7 @@ function viewHome() {
     const cols = peopleColors(e), c = e.kind === 'task' ? mcolor(ME.id) : (EVENT_TYPES.find((x) => x.id === typeOf(e))?.c.replace('rainbow', '#e0a93b'));
     return `<div class="lrow">
       <button class="ckb" style="--c:${c}" data-act="home-check" data-id="${e.id}" aria-label="${esc(e.title)} erledigen">${ic('check')}</button>
-      <div class="lrow__main" data-act="goto" data-date="${e.date < h.t ? h.t : e.date}" data-tab="main"><b>${esc(e.title)}</b><small>${e.kind === 'task' ? 'Auftrag' : esc(EVENT_TYPES.find((x) => x.id === typeOf(e)).label)} · ${esc(peopleLabel(e))}${e.time ? ' · ' + e.time + ' Uhr' : ''}</small></div>
+      <div class="lrow__main" data-act="thread" data-coll="cal" data-id="${e.id}"><b>${esc(e.title)}</b><small>${e.kind === 'task' ? 'Auftrag' : esc(EVENT_TYPES.find((x) => x.id === typeOf(e)).label)} · ${esc(peopleLabel(e))}${e.time ? ' · ' + e.time + ' Uhr' : ''}</small>${threadBadges(threadOf('cal', e))}</div>
       ${datePill(d, h.t, e)}<span class="dots">${cols.slice(0, 4).map((x) => `<span class="dot" style="--c:${x}"></span>`).join('')}</span>${ic('right', 'chev')}</div>`;
   }).join('');
   return `<div class="home-top">
@@ -223,7 +224,7 @@ function dayPanel() {
       const ty = EVENT_TYPES.find((x) => x.id === typeOf(e));
       return `<div class="irow ${e.completed ? 'irow--done' : ''}" style="--c:${c}">
         ${e.kind === 'task' ? `<button class="ckb ${e.completed ? 'ckb--on' : ''}" style="--c:var(--green)" data-act="task-toggle" data-id="${e.id}" aria-label="${e.completed ? 'Als offen markieren' : 'Als erledigt markieren'}">${ic('check')}</button>` : `<span class="ic-ev">${typeOf(e) === 'birthday' ? '🎂' : ic('cal')}</span>`}
-        <div class="irow__main"><b>${esc(e.title)}</b><div class="meta">${e.time ? `<span>${e.time} Uhr</span>` : ''}${multi(e) ? `<span>${fmt(e.date, {day:'2-digit', month:'2-digit'})}–${fmt(e.endDate, {day:'2-digit', month:'2-digit'})}</span>` : ''}<span>${e.kind === 'task' ? 'Auftrag' : esc(ty.label)}</span>${personDots(e) || `<span>${esc(peopleLabel(e))}</span>`}${e.completed && e.completedBy ? `<span>✓ ${esc(mname(e.completedBy))}</span>` : ''}</div>${e.note ? `<div class="note">${esc(e.note)}</div>` : ''}</div>
+        <div class="irow__main" data-act="thread" data-coll="cal" data-id="${e.id}" role="button" tabindex="0" aria-label="${esc(e.title)} öffnen"><b>${esc(e.title)}</b><div class="meta">${threadBadges(threadOf('cal', e), true)}${e.time ? `<span>${e.time} Uhr</span>` : ''}${multi(e) ? `<span>${fmt(e.date, {day:'2-digit', month:'2-digit'})}–${fmt(e.endDate, {day:'2-digit', month:'2-digit'})}</span>` : ''}<span>${e.kind === 'task' ? 'Auftrag' : esc(ty.label)}</span>${personDots(e) || `<span>${esc(peopleLabel(e))}</span>`}${e.completed && e.completedBy ? `<span>✓ ${esc(mname(e.completedBy))}</span>` : ''}</div>${e.note ? `<div class="note">${esc(e.note)}</div>` : ''}</div>
         <button class="edit" data-act="edit" data-id="${e.id}" aria-label="${esc(e.title)} bearbeiten">${ic('edit')}</button></div>`;
     }).join('') : `<div class="empty"><b>Noch nichts geplant</b>Lege direkt einen Termin oder Auftrag für diesen Tag an.</div>`}`;
 }
@@ -264,7 +265,7 @@ function viewTodo() {
       <button class="card newtile" data-act="todo-new" data-kind="event"><span class="badge">${ic('cal')} Termin</span><b>Offen eintragen +</b><span class="small muted">Jemand kann ihn übernehmen</span></button></div>
     <div class="section-h"><h2>Kann jemand übernehmen?</h2><span class="small muted">${pool.length ? plural(pool.length, 'offener Eintrag', 'offene Einträge') : 'Gerade ist alles verteilt'}</span></div>
     ${pool.map((e) => `<div class="card tcard tcard--${e.kind}"><span class="ic-ev" style="${e.kind === 'task' ? 'background:var(--green2);color:var(--green)' : ''}">${ic(e.kind === 'task' ? 'task' : 'cal')}</span>
-      <div class="tcard__body"><span class="tcard__type">${e.kind === 'task' ? 'AUFTRAG' : 'TERMIN'}</span><b>${esc(e.title)}</b>${e.note ? `<div class="small muted">${esc(e.note)}</div>` : ''}<div class="small muted row" style="gap:6px;margin-top:4px">Eingetragen von <span class="pchip"><span class="dot" style="--c:${mcolor(e.createdBy)}"></span>${esc(mname(e.createdBy))}</span></div></div>
+      <div class="tcard__body" data-act="thread" data-coll="todo" data-id="${e.id}" role="button" tabindex="0"><span class="tcard__type">${e.kind === 'task' ? 'AUFTRAG' : 'TERMIN'}</span><b>${esc(e.title)}</b>${e.note ? `<div class="small muted">${esc(e.note)}</div>` : ''}<div class="small muted row" style="gap:6px;margin-top:4px">Eingetragen von <span class="pchip"><span class="dot" style="--c:${mcolor(e.createdBy)}"></span>${esc(mname(e.createdBy))}</span></div>${threadBadges(threadOf('todo', e))}</div>
       <button class="btn btn--sm ${e.kind === 'task' ? 'btn--green' : ''}" data-act="todo-take" data-id="${e.id}">Übernehmen</button>
       <button class="edit" data-act="todo-del" data-id="${e.id}" aria-label="${esc(e.title)} entfernen">${ic('trash')}</button></div>`).join('') || `<div class="card empty"><b>Alles verteilt</b>Neue offene Aufträge und Termine erscheinen hier für die ganze Gruppe.</div>`}`;
 }
@@ -324,6 +325,7 @@ function viewSettings() {
         <div class="field"><input class="input" name="old" type="password" autocomplete="current-password" placeholder="Bisheriges Passwort"></div>
         <div class="two"><input class="input" name="pass" type="password" autocomplete="new-password" placeholder="Neues Passwort"><input class="input" name="pass2" type="password" autocomplete="new-password" placeholder="Wiederholen"></div>
         <button class="btn btn--ghost btn--sm" style="margin-top:10px" type="submit">Passwort ändern</button><div class="small muted" style="margin-top:6px">Andere Geräte werden danach abgemeldet.</div></form></section>
+    ${pushSection()}
     <section class="card pad" style="margin-top:14px"><h2 style="font-size:17px;margin-bottom:10px">Konten auf diesem Gerät</h2>
       ${others.map((a) => `<button class="gitem" data-act="acc-switch" data-id="${a.id}">${avatar({...a, color:'#467ba6'}, 'av--sm')}<span class="grow"><b>${esc(a.name)}</b><div class="small muted">${a.token ? 'Angemeldet – direkt wechseln' : 'Passwort nötig'}</div></span>${ic('right', 'chev')}</button>`).join('')}
       <button class="btn btn--ghost btn--sm" data-act="acc-add">${ic('plus')} Weiteres Konto anmelden</button></section>

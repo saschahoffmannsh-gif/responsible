@@ -5,8 +5,8 @@ function openModal(html, {full=false, sticky=false} = {}) {
   const bg = document.createElement('div'); bg.className = 'modal-bg';
   bg.innerHTML = `<div class="modal ${full ? 'modal--full' : ''}" role="dialog" aria-modal="true">${html}</div>`;
   const close = () => { bg.remove(); document.removeEventListener('keydown', onKey); };
-  const onKey = (e) => { if (e.key === 'Escape') close(); };
-  bg.addEventListener('click', (e) => { if (e.target === bg && !sticky) close(); if (e.target.closest('[data-close]')) close(); });
+  const onKey = (e) => { if (e.key === 'Escape' && $('#modals').lastElementChild === bg && !document.querySelector('.viewer')) bg.close(); };
+  bg.addEventListener('click', (e) => { if (e.target === bg && !sticky) bg.close(); if (e.target.closest('[data-close]')?.closest('.modal-bg') === bg) bg.close(); });
   document.addEventListener('keydown', onKey);
   $('#modals').appendChild(bg); bg.close = close;
   setTimeout(() => bg.querySelector('[autofocus]')?.focus(), 60);
@@ -49,6 +49,7 @@ function openEditor({kind, date, item}) {
     </div>
     <div id="ed-people" style="margin-top:14px"></div>
     ${kind === 'task' && edit ? `<label class="check" style="margin-top:14px"><input type="checkbox" name="completed" ${it.completed ? 'checked' : ''}><span>Auftrag ist erledigt</span></label>` : ''}
+    ${edit ? `<button type="button" class="card th-open" data-open-thread>${ic('chat')}<span class="grow"><b>Nachrichten &amp; Erinnerungen</b><small>${(threadIndex().get(threadOf('cal', it))?.n || 0) ? plural(threadIndex().get(threadOf('cal', it)).n, 'Nachricht', 'Nachrichten') : 'Noch keine – Fotos, Sprachnachrichten, Erinnerungen'}</small></span>${ic('right', 'chev')}</button>` : attachStrip()}
     <div class="field-err" id="ed-err"></div>
     <div class="modal-foot">${edit ? `<button type="button" class="btn btn--dangerghost" data-del>${ic('trash')} Löschen</button>` : ''}<button class="btn ${kind === 'task' ? 'btn--green' : ''}" type="submit">${edit ? 'Änderungen speichern' : kind === 'event' ? 'Termin speichern' : 'Auftrag speichern'}</button></div></form>`, {full:true, sticky:true});
   const f = m.querySelector('form');
@@ -63,6 +64,9 @@ function openEditor({kind, date, item}) {
         <strong>${esc(p.name)}</strong><span class="tick">${ic('check')}</span></button>`).join('')}</div>`;
   };
   paint();
+  const A = edit ? null : wireAttach(m, () => ({coll: 'cal', item: {kind, title: f.title.value, date: f.date.value, time: f.time.value, eventType: st.type, people: kind === 'event' && GENERAL.has(st.type) ? [] : [...st.people]}}));
+  const close0 = m.close; m.close = () => { A?.rec?.cancel(); close0(); };
+  m.querySelector('[data-open-thread]')?.addEventListener('click', () => { m.close(); if (!TH || TH.t !== threadOf('cal', it)) openThread('cal', it.id); });
   m.addEventListener('click', (e) => {
     const t = e.target.closest('[data-type]'); if (t) { st.type = t.dataset.type; paint(); return; }
     const p = e.target.closest('[data-person]');
@@ -75,7 +79,7 @@ function openEditor({kind, date, item}) {
   m.querySelector('[data-del]')?.addEventListener('click', async () => {
     if (!(await confirmDlg('Wirklich löschen?', `„${it.title}“ wird für alle in der Gruppe dauerhaft entfernt.`))) return;
     m.close();
-    try { await saveRow('cal', it.id, null, it.rev, true); toast('Eintrag für alle gelöscht.'); }
+    try { await saveRow('cal', it.id, null, it.rev, true, {purge: true}); toast('Eintrag für alle gelöscht.'); }
     catch (e) { toast(e.code === 'version_conflict' ? 'Der Eintrag wurde auf einem anderen Gerät geändert und neu geladen.' : e.message, 'err'); }
   });
   f.onsubmit = async (e) => {
@@ -89,10 +93,13 @@ function openEditor({kind, date, item}) {
     else { data.people = [...st.people]; data.completed = !!f.completed?.checked; if (data.completed) data.completedBy = it?.completed ? it.completedBy || ME.id : ME.id; }
     if (it?.createdBy) data.createdBy = it.createdBy; else if (!it) data.createdBy = ME.id;
     if (it?.fromTodo) data.fromTodo = true;
+    data.thread = it?.thread || newThreadId();
     const id = it?.id || rid(kind);
+    const att = A?.read();
     m.close();
     UI.sel = data.date; const d = pd(data.date); UI.month = new Date(d.getFullYear(), d.getMonth(), 1, 12);
-    try { await saveRow('cal', id, data, it ? it.rev : 0); toast(kind === 'event' ? 'Termin für alle gespeichert.' : 'Auftrag für alle gespeichert.'); }
+    try { await saveRow('cal', id, data, it ? it.rev : 0); const n = await sendAttachments(data.thread, att, data);
+      toast((kind === 'event' ? 'Termin für alle gespeichert' : 'Auftrag für alle gespeichert') + (n ? ` · ${plural(n, 'Anhang', 'Anhänge')} dabei.` : '.')); }
     catch (er) {
       if (er.code === 'version_conflict') return toast('Der Eintrag wurde auf einem anderen Gerät geändert. Die aktuelle Version wurde neu geladen.', 'err');
       toast('Nicht gespeichert: ' + er.message, 'err');
@@ -165,11 +172,15 @@ function openTodoNew(kind) {
     <h2 style="margin-top:12px">${kind === 'task' ? 'Auftrag in die Liste stellen' : 'Termin in die Liste stellen'}</h2><p class="desc">Noch ohne Person und Datum. Jeder aus der Gruppe kann den Eintrag später übernehmen.</p>
     <div class="field"><label for="td-title">Was steht an?</label><input class="input" id="td-title" name="title" maxlength="120" autofocus required placeholder="${kind === 'task' ? 'z. B. Keller aufräumen' : 'z. B. Termin beim Tierarzt'}"></div>
     <div class="field"><label for="td-note">Notiz <span>optional</span></label><textarea class="input" id="td-note" name="note" rows="3" maxlength="1000" placeholder="Weitere Informationen"></textarea></div>
+    ${attachStrip()}
     <div class="modal-foot"><button type="button" class="btn btn--ghost" data-close>Abbrechen</button><button class="btn ${kind === 'task' ? 'btn--green' : ''}" type="submit" disabled>Offen eintragen</button></div></form>`);
   const f = m.querySelector('form'), b = f.querySelector('[type=submit]');
+  const A = wireAttach(m, () => ({coll: 'todo', item: {kind, title: f.title.value}}));
+  const close0 = m.close; m.close = () => { A.rec?.cancel(); close0(); };
   f.title.addEventListener('input', () => b.disabled = !f.title.value.trim());
-  f.onsubmit = async (e) => { e.preventDefault(); const title = f.title.value.trim(); if (!title) return; m.close();
-    try { await saveRow('todo', rid('todo'), {kind, title, ...(f.note.value.trim() ? {note:f.note.value.trim()} : {}), createdBy:ME.id}, 0); toast(kind === 'task' ? 'Offener Auftrag eingetragen.' : 'Offener Termin eingetragen.'); }
+  f.onsubmit = async (e) => { e.preventDefault(); const title = f.title.value.trim(); if (!title) return; const att = A.read(); m.close(); const thread = newThreadId();
+    try { await saveRow('todo', rid('todo'), {kind, title, ...(f.note.value.trim() ? {note:f.note.value.trim()} : {}), createdBy:ME.id, thread}, 0); const n = await sendAttachments(thread, att, {kind, title});
+      toast((kind === 'task' ? 'Offener Auftrag eingetragen' : 'Offener Termin eingetragen') + (n ? ` · ${plural(n, 'Anhang', 'Anhänge')} dabei.` : '.')); }
     catch (er) { toast(er.message, 'err'); } };
 }
 function openTake(id) {
@@ -183,7 +194,7 @@ function openTake(id) {
   const f = m.querySelector('form'), sb = f.querySelector('[type=submit]');
   f.done.addEventListener('change', () => { $('#tk-datef', m).classList.toggle('hidden', f.done.checked); sb.textContent = f.done.checked ? 'Als erledigt übernehmen' : 'In meinen Kalender'; });
   f.onsubmit = async (ev) => { ev.preventDefault(); if (!f.done.checked && !f.date.value) return; sb.disabled = true; sb.textContent = 'Übernimmt …';
-    try { const j = await api('/take', {g:G, id, date:f.date.value, done:f.done.checked}); m.close();
+    try { const j = await api('/take', {g:G, id, date:f.date.value, done:f.done.checked}); m.close(); if (f.done.checked && TH?.id === id) TH.m.close();
       if (j.removed) D.items.set('todo|' + id, j.removed); if (j.calendarItem) D.items.set('cal|' + j.calendarItem.id, j.calendarItem); saveCache(); render();
       toast(f.done.checked ? 'Als erledigt übernommen.' : `${e.kind === 'task' ? 'Auftrag' : 'Termin'} in deinen Kalender übernommen.`); }
     catch (er) { m.close(); toast(er.message, 'err'); sync(true); } };
@@ -274,6 +285,7 @@ async function startSession() {
   if (pend) handleJoinToken(pend);
 }
 async function logout() {
+  await unbindPushOnLogout();
   try { await api('/logout', {}); } catch {}
   if (ACC.list[ACC.cur]) delete ACC.list[ACC.cur].token;
   ACC.cur = null; saveAcc(); ME = null; GROUPS = []; G = null; D = blankData(); AUTH.err = {}; AUTH.tab = 'login'; AUTH.name = '';
@@ -291,6 +303,7 @@ function route() {
   const h = location.hash.replace(/^#\/?/, '');
   const jm = h.match(/^join\/([a-f0-9]{16,64})/);
   if (jm) { history.replaceState(null, '', location.pathname + '#/home'); UI.view = 'home'; handleJoinToken(jm[1]); return; }
+  const im = h.match(/^item\/([^/]+)\/(.+)$/); if (im) { openThreadRoute(decodeURIComponent(im[1]), decodeURIComponent(im[2])); return; }
   UI.view = ['home','kalender','todo','einkauf','gruppe','einstellungen'].includes(h) ? h : 'home';
   render(); scrollTo(0, 0);
 }
@@ -341,7 +354,9 @@ const ACT = {
     try { await api('/feed', {g:G, action:'delete', id:f.id}); toast('Quelle entfernt.'); sync(true); } catch (e) { toast(e.message, 'err'); } },
   'todo-new': (el) => openTodoNew(el.dataset.kind),
   'todo-take': (el) => openTake(el.dataset.id),
-  'todo-del': async (el) => { const r = D.items.get('todo|' + el.dataset.id); if (!r) return; try { await saveRow('todo', r.id, null, r.rev, true); toast('Eintrag entfernt.'); } catch (e) { toast(e.code === 'version_conflict' ? 'Der Eintrag wurde inzwischen geändert.' : e.message, 'err'); } },
+  'todo-del': async (el) => { const r = D.items.get('todo|' + el.dataset.id); if (!r) return; const tx = threadIndex().get(threadOf('todo', {...r.data, id: r.id}));
+    if (tx && (tx.n || tx.rem) && !(await confirmDlg('Eintrag entfernen?', `„${r.data.title}“ wird mit allen Nachrichten, Fotos und Sprachnachrichten entfernt.`, 'Entfernen'))) return;
+    try { await saveRow('todo', r.id, null, r.rev, true, {purge: true}); toast('Eintrag entfernt.'); } catch (e) { toast(e.code === 'version_conflict' ? 'Der Eintrag wurde inzwischen geändert.' : e.message, 'err'); } },
   'shop-suggest': () => addShop($('#shop-input')?.value || ''),
   'shop-check': async (el) => { if (el.classList.contains('stile--gone')) return; el.classList.add('stile--gone'); await new Promise((r) => setTimeout(r, 220));
     try { await saveRow('shop', el.dataset.id, null, undefined, true); } catch (e) { toast('Der Artikel konnte nicht abgehakt werden.', 'err'); } },
@@ -349,6 +364,8 @@ const ACT = {
   avatar: () => pickFile('image/*', async (f) => { try { const img = await resizeImage(f, 384); const j = await api('/account', {action:'avatar', avatar:img}); ME = j.user; storeMe(); toast('Profilbild aktualisiert.'); sync(true); } catch (e) { toast(e.message, 'err'); } }),
   'avatar-remove': async () => { try { const j = await api('/account', {action:'avatar', avatar:null}); ME = j.user; storeMe(); toast('Profilbild entfernt.'); sync(true); } catch (e) { toast(e.message, 'err'); } },
   logout: () => logout(),
+  thread: (el) => openThread(el.dataset.coll, el.dataset.id),
+  'push-on': () => enablePush(), 'push-off': () => disablePush(), 'push-test': () => testPush(),
   'acc-delete': async () => { const r = await promptDlg('Konto löschen?', [{name:'pass', label:'Zur Bestätigung dein Passwort', type:'password'}], 'Konto endgültig löschen', 'Dein Konto und dein Profilbild werden gelöscht. Gruppen, die dir gehören, gehen an ein anderes Mitglied über oder werden gelöscht.'); if (!r) return;
     try { await api('/account', {action:'delete', pass:r.values.pass}); r.modal.close(); delete ACC.list[ACC.cur]; ACC.cur = null; saveAcc(); ME = null; GROUPS = []; G = null; D = blankData(); go('home'); render(); toast('Dein Konto wurde gelöscht.'); }
     catch (e) { r.modal.querySelector('[data-err]').textContent = e.message; } },
@@ -410,7 +427,7 @@ document.addEventListener('submit', (e) => {
   const f = e.target.closest('form[data-form]'); if (!f) return; e.preventDefault();
   FORMS[f.dataset.form]?.(f, f.closest('.modal-bg'));
 });
-document.addEventListener('keydown', (e) => { if (e.key === 'Enter' && e.target.matches('.acc')) e.target.click(); });
+document.addEventListener('keydown', (e) => { if (e.key === 'Enter' && e.target.matches('.acc,[role=button][data-act]')) e.target.click(); });
 // Monat wischen
 let touch0 = null;
 document.addEventListener('touchstart', (e) => { if (e.touches.length === 1 && e.target.closest('#calgrid')) touch0 = {x:e.touches[0].clientX, y:e.touches[0].clientY}; else touch0 = null; }, {passive:true});
@@ -427,7 +444,10 @@ document.addEventListener('touchend', (e) => {
   UI.view = ['home','kalender','todo','einkauf','gruppe','einstellungen'].includes(h) ? h : 'home';
   const jm = h.match(/^join\/([a-f0-9]{16,64})/);
   if (jm) { sessionStorage.setItem('rs_join', jm[1]); history.replaceState(null, '', location.pathname + '#/home'); }
+  const im = h.match(/^item\/([^/]+)\/(.+)$/);
   if (ACC.cur && token()) await startSession();
+  if (im && ME) openThreadRoute(decodeURIComponent(im[1]), decodeURIComponent(im[2]));
+  if (ME) refreshPush(false);
   const pend = sessionStorage.getItem('rs_join');
   if (!ME && pend) handleJoinToken(pend);
   render(); startPolling();

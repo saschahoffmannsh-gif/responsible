@@ -1,7 +1,7 @@
 'use strict';
 // Responsible – Kern: Hilfsfunktionen, Konten, API, Synchronisation
 const API = window.RS_API || 'https://wlujgkbtpjxuekwsgnmg.supabase.co/functions/v1/responsible';
-const VERSION = '1.0.2';
+const VERSION = '1.1.0';
 const PALETTE = ['#467ba6','#d9778f','#36a78a','#e0a93b','#8a6fd1','#e2725b','#3aa6c9','#7a9a3a','#c45ab3','#5b6b7d','#d4a017','#2f9e6e'];
 const EVENT_TYPES = [
   {id:'private',label:'Privat',c:'#36a78a'},{id:'work',label:'Arbeit',c:'#d6455d'},{id:'vacation',label:'Urlaub',c:'#e0a93b'},
@@ -190,12 +190,12 @@ function selectGroup(id) {
   if (G) sync(true);
 }
 // Schreiben mit optimistischer Anzeige, Rücknahme bei Fehler und Konflikterkennung
-async function saveRow(coll, id, data, base, del=false) {
+async function saveRow(coll, id, data, base, del=false, extra={}) {
   const k = coll + '|' + id, prev = D.items.get(k);
   D.items.set(k, del ? {...(prev || {coll, id}), deleted:true} : {coll, id, data, rev: prev?.rev || 0, deleted:false, by: ME.id, at: new Date().toISOString()});
   PENDING++; PKEYS.add(k); setSync('syncing'); render();
   try {
-    const j = await api('/item', {g:G, coll, id, data, base, del});
+    const j = await api('/item', {g:G, coll, id, data, base, del, ...extra});
     if (j.item) D.items.set(k, j.item); else D.items.delete(k);
     setSync('online'); return j.item;
   } catch (e) {

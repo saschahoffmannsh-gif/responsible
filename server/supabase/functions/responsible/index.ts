@@ -2,12 +2,18 @@
 // Konten (Name + Passwort, PBKDF2, Bearer-Sitzungen, Sperre) wie HopfenMatch; Gruppen (Familie/Team) mit Rollen,
 // Farben und Einladungslinks; synchronisierte Datensätze (rs_item) mit Revisionsprüfung; ICS-Import/-Abo.
 // Nutzt ausschließlich rs_*-Tabellen und den Storage-Bucket "responsible".
+// 1.1: Verläufe je Termin/Auftrag (Text, Bilder, Sprachnachrichten, Erinnerungen) mit privatem Speicher
+// (signierte URLs) und Web Push (VAPID) über einen minütlichen Cron.
 import { createClient } from "npm:@supabase/supabase-js@2.118.0";
+import webpush from "npm:web-push@3.6.7";
 
 const SB_URL = Deno.env.get("SUPABASE_URL")!;
-const db = createClient(SB_URL, Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!, { auth: { persistSession: false } });
-const BUCKET = "responsible";
-const ITER = 100000, MAX_BODY = 4 * 1024 * 1024, SESSION_DAYS = 90;
+// RS_FAKE_DB: nur für lokale Tests (In-Memory-Datenbank), in Produktion nicht gesetzt
+const FAKE = Deno.env.get("RS_FAKE_DB");
+const db: any = FAKE ? (await import(FAKE)).fakeClient() : createClient(SB_URL, Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!, { auth: { persistSession: false } });
+const BUCKET = "responsible", MEDIA = "responsible-media";
+const ITER = 100000, MAX_BODY = 7 * 1024 * 1024, SESSION_DAYS = 90;
+const FN_URL = Deno.env.get("RS_FN_URL") || `${SB_URL}/functions/v1/responsible`;
 const NAME_RE = /^[\p{L}\p{N}](?:[\p{L}\p{N} ._'-]{0,22}[\p{L}\p{N}])?$/u;
 const COLOR_RE = /^#[0-9a-fA-F]{6}$/;
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/, TIME_RE = /^([01]\d|2[0-3]):[0-5]\d$/;
@@ -122,6 +128,7 @@ async function members(g: string) {
 async function deleteGroup(g: string) {
   const gr = must(await db.from("rs_group").select("image").eq("id", g).maybeSingle()) as any;
   await removeImage(gr?.image);
+  await removeFolder(`g/${g}`);
   must(await db.from("rs_group").delete().eq("id", g));
 }
 
@@ -172,7 +179,170 @@ function validCal(d: any, memberIds: string[]) {
   o.people = people;
   if (d.createdBy && memberIds.includes(String(d.createdBy))) o.createdBy = String(d.createdBy);
   if (d.fromTodo) o.fromTodo = true;
+  if (typeof d.thread === "string" && TH_RE.test(d.thread)) o.thread = d.thread;
   return o;
+}
+const TH_RE = /^th-[a-zA-Z0-9_-]{6,40}$/;
+
+// ---- Verläufe ----
+const THREAD_RE = /^(th-[a-zA-Z0-9_-]{6,40}|(cal|todo):[a-zA-Z0-9_.:-]{3,120})$/;
+const folderOf = (g: string, t: string) => `g/${g}/t/${t.replace(/[^a-zA-Z0-9_-]/g, "_")}`;
+// Lebender Termin/Auftrag/offener Eintrag, zu dem der Verlauf gehört
+async function threadItem(g: string, t: string) {
+  const pm = t.match(/^(cal|todo):(.+)$/);
+  if (pm) { const it = await getItem(g, pm[1], pm[2]); if (it && !it.deleted && !it.data?.thread) return it; }
+  const rows = must(await db.from("rs_item").select("coll,id,data,rev,deleted,updated_by,updated_at,seq").eq("grp", g).in("coll", ["cal", "todo"]).eq("deleted", false).eq("data->>thread", t).limit(1)) as any[];
+  return rows[0] || null;
+}
+async function listAll(bucket: string, prefix: string, out: string[] = [], depth = 0): Promise<string[]> {
+  if (depth > 4) return out;
+  for (let off = 0; off < 10000; off += 1000) {
+    const r = await db.storage.from(bucket).list(prefix, { limit: 1000, offset: off });
+    if (r.error || !r.data?.length) break;
+    for (const f of r.data) { if (f.id) out.push(`${prefix}/${f.name}`); else await listAll(bucket, `${prefix}/${f.name}`, out, depth + 1); }
+    if (r.data.length < 1000) break;
+  }
+  return out;
+}
+async function removeFolder(prefix: string) {
+  const files = await listAll(MEDIA, prefix);
+  for (let i = 0; i < files.length; i += 500) await db.storage.from(MEDIA).remove(files.slice(i, i + 500)).catch(() => {});
+  return files.length;
+}
+const mediaOf = (d: any) => [...(d?.images || []).flatMap((x: any) => [x.p, x.t]), d?.voice?.p].filter((x) => typeof x === "string");
+// Verlauf samt Medien und Erinnerungen löschen
+async function purgeThread(g: string, t: string) {
+  const msgs = must(await db.from("rs_item").select("id").eq("grp", g).eq("coll", "msg").eq("deleted", false).eq("data->>thread", t)) as any[];
+  for (let i = 0; i < msgs.length; i += 200) must(await db.from("rs_item").update({ deleted: true, data: null }).eq("grp", g).eq("coll", "msg").in("id", msgs.slice(i, i + 200).map((r) => r.id)));
+  const files = await removeFolder(folderOf(g, t));
+  return { messages: msgs.length, files };
+}
+const PRESETS: Record<string, number> = { start: 0, m10: 10, h1: 60, d1: 1440 };
+function berlinToUtc(date: string, time: string) { // lokale Zeit Europe/Berlin -> Date (UTC)
+  const [y, mo, d] = date.split("-").map(Number), [h, mi] = time.split(":").map(Number);
+  let t = Date.UTC(y, mo - 1, d, h, mi);
+  for (let i = 0; i < 2; i++) { const b = berlin(new Date(t)); const [by, bmo, bd] = b.date.split("-").map(Number), [bh, bmi] = b.time.split(":").map(Number); t += Date.UTC(y, mo - 1, d, h, mi) - Date.UTC(by, bmo - 1, bd, bh, bmi); }
+  return new Date(t);
+}
+const presetAt = (item: any, preset: string) => new Date(berlinToUtc(item.date, item.time || "08:00").getTime() - PRESETS[preset] * 60e3).toISOString();
+async function validMsg(g: string, d: any, me: string) {
+  if (!d || typeof d !== "object") return "Ungültige Nachricht.";
+  const t = String(d.thread || ""); if (!THREAD_RE.test(t)) return "Ungültiger Verlauf.";
+  const item = await threadItem(g, t); if (!item) return "Der Eintrag existiert nicht mehr.";
+  const o: any = { thread: t, type: d.type, author: me, at: undefined };
+  delete o.at;
+  const folder = folderOf(g, t) + "/";
+  if (d.type === "text") { const text = str(d.text, 2000); if (!text) return "Die Nachricht ist leer."; o.text = text; }
+  else if (d.type === "image") {
+    const imgs = Array.isArray(d.images) ? d.images.slice(0, 6) : [];
+    if (!imgs.length) return "Kein Bild.";
+    o.images = [];
+    for (const x of imgs) {
+      if (typeof x?.p !== "string" || !x.p.startsWith(folder) || (x.t && (typeof x.t !== "string" || !x.t.startsWith(folder)))) return "Ungültiges Bild.";
+      o.images.push({ p: x.p, t: x.t || x.p, w: Math.min(4000, Math.max(1, Number(x.w) || 1)), h: Math.min(4000, Math.max(1, Number(x.h) || 1)) });
+    }
+    const text = str(d.text, 2000); if (text) o.text = text;
+  } else if (d.type === "voice") {
+    const v = d.voice; if (typeof v?.p !== "string" || !v.p.startsWith(folder)) return "Ungültige Sprachnachricht.";
+    o.voice = { p: v.p, dur: Math.min(130, Math.max(0, Math.round((Number(v.dur) || 0) * 10) / 10)), mime: str(v.mime, 60) };
+    if (Array.isArray(v.peaks)) o.voice.peaks = v.peaks.slice(0, 48).map((n: unknown) => Math.min(99, Math.max(0, Math.round(Number(n) || 0))));
+  } else if (d.type === "reminder") {
+    o.target = ["me", "assignees", "all"].includes(d.target) ? d.target : "me";
+    o.preset = d.preset in PRESETS && item.data.date ? d.preset : "custom";
+    const at = o.preset === "custom" ? new Date(String(d.at || "")) : new Date(presetAt(item.data, o.preset));
+    if (isNaN(at.getTime())) return "Ungültige Zeit.";
+    if (at.getTime() < Date.now() - 5 * 60e3) return "Dieser Zeitpunkt liegt in der Vergangenheit.";
+    if (at.getTime() > Date.now() + 5 * 366 * 864e5) return "Der Zeitpunkt liegt zu weit in der Zukunft.";
+    o.at = at.toISOString();
+  } else return "Unbekannte Nachrichtenart.";
+  return o;
+}
+
+// ---- Web Push ----
+let VAPID: { publicKey: string; privateKey: string } | null = null;
+async function vapid() {
+  if (!VAPID) VAPID = (must(await db.from("rs_meta").select("v").eq("k", "vapid").maybeSingle()) as any)?.v ?? null;
+  return VAPID;
+}
+const PUSH_HOSTS = [/^fcm\.googleapis\.com$/, /(^|\.)push\.services\.mozilla\.com$/, /(^|\.)push\.apple\.com$/, /(^|\.)notify\.windows\.com$/, /^android\.googleapis\.com$/];
+function pushEndpointOk(ep: string) {
+  try {
+    const u = new URL(ep);
+    if (ep.startsWith(FN_URL + "/push-sink/") && /^[a-f0-9]{16,40}$/.test(ep.slice(FN_URL.length + 11))) return true; // Test-Empfänger
+    return u.protocol === "https:" && PUSH_HOSTS.some((r) => r.test(u.hostname));
+  } catch { return false; }
+}
+async function sendPush(users: string[], payload: Record<string, unknown>) {
+  const res = { subs: 0, sent: 0, gone: 0, failed: 0, statuses: [] as number[] };
+  if (!users.length) return res;
+  const v = await vapid(); if (!v) return res;
+  const subs = must(await db.from("rs_push").select("endpoint,p256dh,auth,fails").in("usr", users)) as any[];
+  res.subs = subs.length;
+  for (const s of subs) {
+    let status = 0;
+    try {
+      const d = webpush.generateRequestDetails({ endpoint: s.endpoint, keys: { p256dh: s.p256dh, auth: s.auth } }, JSON.stringify(payload),
+        { TTL: 6 * 3600, urgency: "high", vapidDetails: { subject: "https://saschahoffmannsh-gif.github.io/responsible/", publicKey: v.publicKey, privateKey: v.privateKey } });
+      const ctl = new AbortController(); const tm = setTimeout(() => ctl.abort(), 10000);
+      const r = await fetch(d.endpoint, { method: "POST", headers: d.headers as any, body: d.body as any, signal: ctl.signal }).finally(() => clearTimeout(tm));
+      status = r.status; await r.body?.cancel();
+    } catch (e) { console.error("push", e); }
+    res.statuses.push(status);
+    if (status >= 200 && status < 300) { res.sent++; await db.from("rs_push").update({ last_ok: new Date().toISOString(), fails: 0 }).eq("endpoint", s.endpoint); }
+    else if (status === 404 || status === 410 || (s.fails || 0) >= 20) { res.gone++; await db.from("rs_push").delete().eq("endpoint", s.endpoint); }
+    else { res.failed++; await db.from("rs_push").update({ fails: (s.fails || 0) + 1 }).eq("endpoint", s.endpoint); }
+  }
+  return res;
+}
+const WDS = ["So.", "Mo.", "Di.", "Mi.", "Do.", "Fr.", "Sa."];
+function whenLabel(d: any) {
+  if (!d?.date) return "";
+  const x = dOf(d.date); const s = `${WDS[x.getUTCDay()]} ${pad(x.getUTCDate())}.${pad(x.getUTCMonth() + 1)}.`;
+  return d.time ? `${s} · ${d.time} Uhr` : s;
+}
+async function recipients(g: string, msg: any, item: any) {
+  const ids = (must(await db.from("rs_member").select("usr").eq("grp", g)) as any[]).map((r) => r.usr);
+  if (msg.target === "me") return ids.filter((x) => x === msg.author);
+  if (msg.target === "assignees" && item?.coll === "cal") {
+    const p: string[] = item.data.people || [];
+    if (p.length && !p.includes("all")) return ids.filter((x) => p.includes(x));
+  }
+  return ids;
+}
+async function runReminders() {
+  const now = new Date().toISOString();
+  const due = must(await db.from("rs_item").select("grp,id,data,rev").eq("coll", "msg").eq("deleted", false).eq("data->>type", "reminder").is("data->>sent", null).lte("data->>at", now).limit(200)) as any[];
+  const out: any[] = [];
+  for (const r of due) {
+    const claim = await writeItem(r.grp, "msg", r.id, { ...r.data, sent: now }, r.data.author, r.rev);
+    if (!claim.ok) continue; // anderer Lauf war schneller
+    const item = await threadItem(r.grp, r.data.thread);
+    if (!item) { out.push({ id: r.id, skipped: "gone" }); continue; }
+    const users = await recipients(r.grp, r.data, item);
+    const grp = must(await db.from("rs_group").select("name").eq("id", r.grp).maybeSingle()) as any;
+    const res = await sendPush(users, {
+      title: `🔔 ${item.data.title}`,
+      body: [whenLabel(item.data) || "Offener Eintrag", grp?.name].filter(Boolean).join(" · "),
+      url: `./#/item/${r.grp}/${encodeURIComponent(r.data.thread)}`, tag: r.id,
+    });
+    await db.from("rs_item").update({ data: { ...r.data, sent: now, pushed: res.sent } }).eq("grp", r.grp).eq("coll", "msg").eq("id", r.id);
+    out.push({ id: r.id, users: users.length, ...res });
+  }
+  return out;
+}
+// Verwaiste Verläufe (Eintrag gelöscht, z. B. nach „erledigt“ ohne Rückgängig) aufräumen
+async function gcThreads() {
+  const rows = must(await db.from("rs_item").select("grp,data,updated_at").eq("coll", "msg").eq("deleted", false).limit(20000)) as any[];
+  const seen = new Map<string, string>();
+  for (const r of rows) { const k = r.grp + "|" + r.data?.thread; if (!seen.has(k) || seen.get(k)! < r.updated_at) seen.set(k, r.updated_at); }
+  let purged = 0;
+  for (const [k, last] of seen) {
+    const [g, t] = [k.slice(0, k.indexOf("|")), k.slice(k.indexOf("|") + 1)];
+    if (Date.now() - Date.parse(last) < 3600e3) continue;
+    if (!(await threadItem(g, t))) { await purgeThread(g, t); purged++; }
+  }
+  await db.from("rs_meta").delete().like("k", "sink:%").lt("t", new Date(Date.now() - 864e5).toISOString());
+  return purged;
 }
 
 // ---- ICS ----
@@ -348,9 +518,28 @@ Deno.serve(async (req) => {
     if (path === "/cron" && req.method === "POST") {
       const sec = must(await db.from("rs_meta").select("v").eq("k", "cron").maybeSingle()) as any;
       if (!sec || req.headers.get("x-rs-cron") !== sec.v) return json({ error: "nein" }, 403);
+      const cb = await body();
+      if (cb.job === "reminders") return json({ ok: true, reminders: await runReminders() });
+      const purged = await gcThreads().catch((e) => { console.error(e); return -1; });
       const feeds = must(await db.from("rs_item").select("grp,id,data").eq("coll", "feed").eq("deleted", false).eq("data->>type", "url")) as any[];
       const res = []; for (const f of feeds) res.push(await refreshFeed(f.grp, f, null));
-      return json({ ok: true, feeds: feeds.length, res });
+      return json({ ok: true, feeds: feeds.length, res, purged });
+    }
+
+    if (path === "/push/key") return json({ key: (await vapid())?.publicKey ?? null });
+
+    // Test-Empfänger für Web Push: nimmt verschlüsselte Nachrichten für ein registriertes Test-Abo entgegen
+    const sk = path.match(/^\/push-sink\/([a-f0-9]{16,40})$/);
+    if (sk && req.method === "POST") {
+      const ep = `${FN_URL}/push-sink/${sk[1]}`;
+      const sub = must(await db.from("rs_push").select("usr").eq("endpoint", ep).maybeSingle()) as any;
+      if (!sub) return new Response(null, { status: 410, headers: CORS });
+      const buf = new Uint8Array(await req.arrayBuffer()); if (buf.length > 8192) return new Response(null, { status: 413, headers: CORS });
+      const old = (must(await db.from("rs_meta").select("v").eq("k", "sink:" + sk[1]).maybeSingle()) as any)?.v || [];
+      let b64 = ""; for (const x of buf) b64 += String.fromCharCode(x);
+      const entry = { at: new Date().toISOString(), enc: req.headers.get("content-encoding"), ttl: req.headers.get("ttl"), urgency: req.headers.get("urgency"), vapid: (req.headers.get("authorization") || "").slice(0, 12), body: btoa(b64) };
+      must(await db.from("rs_meta").upsert({ k: "sink:" + sk[1], v: [...old.slice(-4), entry], t: new Date().toISOString() }));
+      return new Response(null, { status: 201, headers: CORS });
     }
 
     const im = path.match(/^\/invite\/([a-f0-9]{16,64})$/);
@@ -563,6 +752,7 @@ Deno.serve(async (req) => {
         else if (coll === "todo") {
           const d = b.data || {}; const title = str(d.title, 120); if (!title) return err("Bitte einen Titel eingeben.", 400);
           data = { kind: d.kind === "event" ? "event" : "task", title, createdBy: me }; const note = str(d.note, 1000); if (note) data.note = note;
+          if (typeof d.thread === "string" && TH_RE.test(d.thread)) data.thread = d.thread;
         } else if (coll === "shop") {
           const d = b.data || {}; const label = str(d.label, 120); if (!label) return err("Bitte einen Artikel eingeben.", 400);
           data = { label, productKey: str(d.productKey, 40) || "custom", addedBy: me };
@@ -572,17 +762,42 @@ Deno.serve(async (req) => {
           const cur = await getItem(g, coll, id); if (cur && cur.data?.feed !== "manual") return err("Importierte Termine können nicht bearbeitet werden.", 400);
           data = { feed: "manual", title, date: d.date, kind: WASTE_KINDS.includes(d.kind) ? d.kind : wasteKind(title), createdBy: me };
           if (d.time && TIME_RE.test(d.time)) data.time = d.time; const note = str(d.note, 500); if (note) data.note = note;
+        } else if (coll === "msg") {
+          const cur = await getItem(g, coll, id); if (cur && !cur.deleted) return err("Nachrichten können nicht bearbeitet werden.", 400);
+          if (!id.startsWith("m-")) return err("Ungültige ID.", 400);
+          data = await validMsg(g, b.data, me); if (typeof data === "string") return err(data, 400);
         } else if (coll === "feed") {
           const cur = await getItem(g, coll, id); if (!cur || cur.deleted) return err("Kalenderquelle nicht gefunden.", 404);
           data = { ...cur.data, name: str(b.data?.name, 60) || cur.data.name, color: COLOR_RE.test(b.data?.color) ? b.data.color : cur.data.color };
         } else return err("Unbekannte Liste.", 400);
+        if ((coll === "cal" || coll === "todo")) { // Verlauf bleibt am Eintrag hängen
+          const cur = await getItem(g, coll, id);
+          if (cur?.data?.thread) data.thread = cur.data.thread; else if (cur && !cur.deleted) delete data.thread;
+          if (coll === "todo" && cur?.data?.createdBy) data.createdBy = cur.data.createdBy;
+        }
       } else {
-        if (!["cal", "todo", "shop", "fev"].includes(coll)) return err("Unbekannte Liste.", 400);
+        if (!["cal", "todo", "shop", "fev", "msg"].includes(coll)) return err("Unbekannte Liste.", 400);
+        if (coll === "msg") {
+          const cur = await getItem(g, coll, id);
+          if (cur && !cur.deleted && cur.data?.author !== me && m.role === "member") return err("Nur eigene Nachrichten können gelöscht werden.", 403);
+          if (cur && !cur.deleted) { const files = mediaOf(cur.data); if (files.length) await db.storage.from(MEDIA).remove(files).catch(() => {}); }
+        }
         if (coll === "fev") { const cur = await getItem(g, coll, id); if (cur && cur.data?.feed !== "manual") return err("Importierte Termine bitte über die Kalenderquelle entfernen.", 400); }
       }
+      const before = (coll === "cal" || coll === "todo") ? await getItem(g, coll, id) : null;
       const r = await writeItem(g, coll, id, data, me, base, !!b.del);
       if (!r.ok) return err("Der Eintrag wurde auf einem anderen Gerät geändert.", 409, { code: "version_conflict", current: r.current });
-      return json({ ok: true, item: r.item });
+      let purged = null;
+      if (before && !before.deleted) {
+        const t = before.data?.thread || `${coll}:${id}`;
+        if (b.del && b.purge) purged = await purgeThread(g, t);
+        // Erinnerungen mit Vorlage (z. B. „1 Std vorher“) wandern mit, wenn Datum/Uhrzeit geändert werden
+        if (!b.del && coll === "cal" && (before.data.date !== data.date || (before.data.time || "") !== (data.time || ""))) {
+          const rem = must(await db.from("rs_item").select("id,data,rev").eq("grp", g).eq("coll", "msg").eq("deleted", false).eq("data->>thread", t).eq("data->>type", "reminder").is("data->>sent", null)) as any[];
+          for (const x of rem) if (x.data.preset in PRESETS) await writeItem(g, "msg", x.id, { ...x.data, at: presetAt(data, x.data.preset) }, x.data.author, x.rev);
+        }
+      }
+      return json({ ok: true, item: r.item, purged });
     }
 
     if (path === "/done" && req.method === "POST") { // Bestätigung „rausgestellt“/„erledigt“ für gemeinsame Termine
@@ -607,9 +822,83 @@ Deno.serve(async (req) => {
         const data: any = { kind: d.kind, title: d.title, date: b.date, people: [me], createdBy: d.createdBy || me, fromTodo: true };
         if (d.note) data.note = d.note;
         if (d.kind === "task") data.completed = false; else data.eventType = "private";
+        data.thread = d.thread || `th-todo-${id}`.replace(/[^a-zA-Z0-9_-]/g, "_").slice(0, 43);
+        if (!d.thread) { // alte Einträge ohne eigene Verlaufs-ID: Nachrichten umhängen
+          const msgs = must(await db.from("rs_item").select("id,data,rev").eq("grp", g).eq("coll", "msg").eq("deleted", false).eq("data->>thread", `todo:${id}`)) as any[];
+          for (const x of msgs) await writeItem(g, "msg", x.id, { ...x.data, thread: data.thread }, x.data.author, x.rev);
+        }
         cal = (await writeItem(g, "cal", cid, data, me)).item;
-      }
+      } else await purgeThread(g, cur.data.thread || `todo:${id}`);
       return json({ ok: true, removed: del.item, calendarItem: cal });
+    }
+
+    // ---- Anhänge (privater Bucket) ----
+    if (path === "/media" && req.method === "POST") {
+      const b = await body(); const g = String(b.g || ""), t = String(b.thread || "");
+      const m = await membership(g, me); if (!m) return err("Du bist kein Mitglied dieser Gruppe.", 403, { gone: true });
+      if (await limited(["media:" + me], 300)) return err("Zu viele Uploads – bitte kurz warten.", 429);
+      if (!THREAD_RE.test(t) || !(await threadItem(g, t))) return err("Der Eintrag existiert nicht mehr.", 404);
+      const dec = (s: unknown, re: RegExp, max: number) => {
+        if (typeof s !== "string") return null; const mm = s.match(re); if (!mm || mm[2].length > max * 1.37) return null;
+        return { mime: mm[1], bytes: Uint8Array.from(atob(mm[2]), (c) => c.charCodeAt(0)) };
+      };
+      const folder = folderOf(g, t), id = Date.now().toString(36) + rnd(6);
+      const put = async (p: string, bytes: Uint8Array, type: string) => { const up = await db.storage.from(MEDIA).upload(p, bytes, { contentType: type, upsert: false, cacheControl: "31536000" }); if (up.error) throw up.error; return p; };
+      if (b.kind === "image") {
+        const img = dec(b.data, /^data:(image\/jpeg);base64,([A-Za-z0-9+/=]+)$/, 2.6e6), th = dec(b.thumb, /^data:(image\/jpeg);base64,([A-Za-z0-9+/=]+)$/, 4e5);
+        if (!img || img.bytes[0] !== 0xff || img.bytes[1] !== 0xd8 || (b.thumb && !th)) return err("Das Bild konnte nicht verarbeitet werden.", 400);
+        await bump(["media:" + me]);
+        const p = await put(`${folder}/${id}.jpg`, img.bytes, "image/jpeg");
+        const tp = th ? await put(`${folder}/${id}_t.jpg`, th.bytes, "image/jpeg") : p;
+        return json({ ok: true, p, t: tp });
+      }
+      if (b.kind === "voice") {
+        const v = dec(b.data, /^data:(audio\/(?:mp4|webm|ogg|mpeg|aac|x-m4a))(?:;[^,]*)?;base64,([A-Za-z0-9+/=]+)$/, 3.8e6);
+        if (!v || v.bytes.length < 200) return err("Die Sprachnachricht konnte nicht verarbeitet werden.", 400);
+        await bump(["media:" + me]);
+        const ext = { "audio/mp4": "m4a", "audio/x-m4a": "m4a", "audio/aac": "aac", "audio/webm": "webm", "audio/ogg": "ogg", "audio/mpeg": "mp3" }[v.mime] || "bin";
+        const p = await put(`${folder}/${id}.${ext}`, v.bytes, v.mime === "audio/x-m4a" ? "audio/mp4" : v.mime);
+        return json({ ok: true, p, mime: v.mime });
+      }
+      return err("Unbekannte Art.", 400);
+    }
+    if (path === "/sign" && req.method === "POST") { // signierte, zeitlich begrenzte Links für Anhänge der eigenen Gruppe
+      const b = await body(); const g = String(b.g || "");
+      const m = await membership(g, me); if (!m) return err("Du bist kein Mitglied dieser Gruppe.", 403, { gone: true });
+      const paths = (Array.isArray(b.paths) ? b.paths : []).map(String).filter((p: string) => p.startsWith(`g/${g}/t/`) && !p.includes("..")).slice(0, 100);
+      if (!paths.length) return json({ ok: true, urls: {}, ttl: 0 });
+      const r = await db.storage.from(MEDIA).createSignedUrls(paths, 6 * 3600);
+      if (r.error) throw r.error;
+      const urls: Record<string, string> = {};
+      for (const x of r.data || []) if (x.signedUrl && x.path) urls[x.path] = x.signedUrl;
+      return json({ ok: true, urls, ttl: 6 * 3600 });
+    }
+
+    // ---- Web Push ----
+    if (path === "/push" && req.method === "POST") {
+      const b = await body();
+      if (b.action === "subscribe") {
+        const s = b.sub || {}; const ep = String(s.endpoint || ""), p256dh = String(s.keys?.p256dh || ""), au = String(s.keys?.auth || "");
+        if (!pushEndpointOk(ep) || !/^[A-Za-z0-9_-]{80,100}$/.test(p256dh) || !/^[A-Za-z0-9_-]{16,32}$/.test(au)) return err("Dieses Gerät kann keine Mitteilungen empfangen.", 400);
+        const n = (must(await db.from("rs_push").select("endpoint").eq("usr", me)) as any[]).length;
+        if (n >= 10) { const old = must(await db.from("rs_push").select("endpoint").eq("usr", me).order("created_at").limit(1)) as any[]; if (old[0]) await db.from("rs_push").delete().eq("endpoint", old[0].endpoint); }
+        must(await db.from("rs_push").upsert({ endpoint: ep, usr: me, p256dh, auth: au, ua: str(b.ua, 120) || null, fails: 0 }));
+        return json({ ok: true });
+      }
+      if (b.action === "unsubscribe") { await db.from("rs_push").delete().eq("endpoint", String(b.endpoint || "")).eq("usr", me); return json({ ok: true }); }
+      if (b.action === "status") { const rows = must(await db.from("rs_push").select("endpoint,last_ok,created_at").eq("usr", me)) as any[]; return json({ ok: true, count: rows.length, endpoints: rows.map((r) => r.endpoint.slice(0, 40)) }); }
+      if (b.action === "test") {
+        if (await limited(["ptest:" + me], 10)) return err("Bitte kurz warten.", 429);
+        await bump(["ptest:" + me]);
+        return json({ ok: true, ...(await sendPush([me], { title: "🔔 Responsible", body: "Mitteilungen sind aktiv – so sehen Erinnerungen aus.", url: "./#/home", tag: "test" })) });
+      }
+      if (b.action === "sink") { // Test: empfangene verschlüsselte Nachrichten eines eigenen Test-Abos lesen
+        const id = String(b.id || ""); const ep = `${FN_URL}/push-sink/${id}`;
+        const sub = must(await db.from("rs_push").select("usr").eq("endpoint", ep).maybeSingle()) as any;
+        if (!sub || sub.usr !== me) return err("Nicht gefunden.", 404);
+        return json({ ok: true, entries: (must(await db.from("rs_meta").select("v").eq("k", "sink:" + id).maybeSingle()) as any)?.v || [] });
+      }
+      return err("Unbekannte Aktion.", 400);
     }
 
     if (path === "/feed" && req.method === "POST") {
