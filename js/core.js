@@ -1,7 +1,7 @@
 'use strict';
 // Responsible – Kern: Hilfsfunktionen, Konten, API, Synchronisation
 const API = window.RS_API || 'https://wlujgkbtpjxuekwsgnmg.supabase.co/functions/v1/responsible';
-const VERSION = '1.1.0';
+const VERSION = '1.1.1';
 const PALETTE = ['#467ba6','#d9778f','#36a78a','#e0a93b','#8a6fd1','#e2725b','#3aa6c9','#7a9a3a','#c45ab3','#5b6b7d','#d4a017','#2f9e6e'];
 const EVENT_TYPES = [
   {id:'private',label:'Privat',c:'#36a78a'},{id:'work',label:'Arbeit',c:'#d6455d'},{id:'vacation',label:'Urlaub',c:'#e0a93b'},
@@ -167,7 +167,7 @@ async function doSync(manual) {
       D.seq = Math.max(D.seq, j.seq || 0); more = !!j.more;
     }
     setSync('online');
-    if (changed) { saveCache(); render(); }
+    if (changed) { saveCache(); render(); document.dispatchEvent(new Event('rs:data')); }
     if (Date.now() - lastMe > 60000) refreshMe();
   } catch (e) {
     if (e.gone) { toast('Du bist nicht mehr Mitglied dieser Gruppe.', 'err'); await refreshMe(true); }

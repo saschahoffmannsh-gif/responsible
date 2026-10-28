@@ -39,7 +39,7 @@ try {
   // --- A legt Termin mit Anhängen an
   await pa.click('[data-act=nav][data-view=kalender]:visible >> nth=0'); await pa.click('[data-act=new-event]');
   await pa.fill('#ed-title', 'Elternabend Klasse 3b'); await pa.fill('#ed-date', ymd(tomorrow)); await pa.fill('#ed-time', '18:00');
-  await pa.click(`[data-person="${B.user.id}"]`); await pa.click(`[data-person="${A.user.id}"]`);
+  await pa.waitForSelector(`[data-person="${B.user.id}"]`, { timeout: 20000 }); await pa.click(`[data-person="${B.user.id}"]`); await pa.click(`[data-person="${A.user.id}"]`);
   await pa.click('[data-att=text]'); await pa.fill('#att-text', 'Kann jemand Kuchen mitbringen? 🍰 Ich hab die Liste fotografiert.');
   const [fc] = await Promise.all([pa.waitForEvent('filechooser'), pa.click('[data-att=photo]')]); await fc.setFiles('fixtures/photo.jpg');
   await pa.waitForSelector('.att__imgs img');

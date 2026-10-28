@@ -64,8 +64,11 @@ function openEditor({kind, date, item}) {
         <strong>${esc(p.name)}</strong><span class="tick">${ic('check')}</span></button>`).join('')}</div>`;
   };
   paint();
+  let memSig = D.members.map((x) => x.id + x.color + x.name).join();
+  const onData = () => { const n = D.members.map((x) => x.id + x.color + x.name).join(); if (n !== memSig) { memSig = n; paint(); } };
+  document.addEventListener('rs:data', onData);
   const A = edit ? null : wireAttach(m, () => ({coll: 'cal', item: {kind, title: f.title.value, date: f.date.value, time: f.time.value, eventType: st.type, people: kind === 'event' && GENERAL.has(st.type) ? [] : [...st.people]}}));
-  const close0 = m.close; m.close = () => { A?.rec?.cancel(); close0(); };
+  const close0 = m.close; m.close = () => { document.removeEventListener('rs:data', onData); A?.rec?.cancel(); close0(); };
   m.querySelector('[data-open-thread]')?.addEventListener('click', () => { m.close(); if (!TH || TH.t !== threadOf('cal', it)) openThread('cal', it.id); });
   m.addEventListener('click', (e) => {
     const t = e.target.closest('[data-type]'); if (t) { st.type = t.dataset.type; paint(); return; }
