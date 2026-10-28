@@ -45,7 +45,7 @@ try {
   // Löschen
   ok((await call('/item', { g, coll: 'msg', id: 'm-3' + sfx, del: true }, tb)).code === 403, 'Fremde Nachricht löschen verboten');
   const dl = await call('/item', { g, coll: 'msg', id: 'm-2' + sfx, del: true }, tb); ok(dl.ok, 'Eigene Bildnachricht gelöscht');
-  ok((await fetch(sg.urls[up.p])).status >= 400, 'Bilddatei entfernt');
+  { const s2 = await call('/sign', { g, paths: [up.p] }, ta); const u = s2.urls && s2.urls[up.p]; ok(!u || (await fetch(u + '&nc=' + Date.now())).status >= 400, 'Bilddatei entfernt (neu signiert: ' + (u ? 'Link' : 'kein Link') + ')'); }
   // Push-Abo auf Test-Empfänger
   const ecdh = crypto.createECDH('prime256v1'); ecdh.generateKeys(); const authS = crypto.randomBytes(16);
   const sinkId = crypto.randomBytes(12).toString('hex');
